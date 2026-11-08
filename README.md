@@ -66,8 +66,9 @@ Demo of layers 3–4: `cargo run --example graded_demo`.
    re-walks a growing DAG at escalating precision.
 
 6. **`src/irram.rs` — the exact carrier done right.** An iRRAM-style `Real`
-   (named after Norbert Müller's *iRRAM* C++ library — "iteration on the
-   RaRaM", the exact-real-arithmetic framework this follows): imperative
+   (after Norbert Müller's *iRRAM*, the C++ exact-real-arithmetic library built
+   on the Real-RAM model, whose reiterate-on-imprecision architecture this
+   follows): imperative
    *interval* arithmetic over multi-precision rationals (endpoints rounded
    outward each op, so numbers stay bounded = fast), comparisons that signal
    *reiterate* when they cannot resolve, and a `run` driver that executes the
