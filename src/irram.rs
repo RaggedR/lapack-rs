@@ -4,33 +4,31 @@
 //! escalating precision, which is hopeless for iterative algorithms. This module
 //! uses the architecture real exact-real libraries (iRRAM) use instead:
 //!
-//!  1. A value is an **interval** `[lo, hi]` of multi-precision dyadic rationals.
-//!     Every operation rounds its endpoints *outward* to the current working
-//!     precision, so the numbers stay bounded in size — each run is plain
-//!     imperative arithmetic, no lazy trees.
-//!  2. A **comparison that cannot be resolved** at the current precision (the
-//!     intervals overlap) raises a *reiterate* signal instead of guessing.
+//!  1. A value is an **interval** `[lo, hi]`. Because every result is rounded to
+//!     a multiple of `2^(-p)` at the working precision `p`, the endpoints are
+//!     stored as **integer mantissas** `m` meaning `m·2^(-p)` — dyadic
+//!     fixed-point. No rationals, so **no GCD, no denominator growth**:
+//!     add/sub are integer add/sub, `√` is an *integer* square root, and
+//!     comparison is a bare integer compare.
+//!  2. A **comparison that cannot be resolved** at `p` (the intervals overlap)
+//!     raises a thread-local *reiterate* signal instead of guessing.
 //!  3. A **driver** runs the whole computation at precision `p`; if the result
 //!     did not resolve tightly enough (or a comparison reiterated), it doubles
-//!     `p` and runs the *entire thing again*. The precision search is around the
-//!     whole computation, not per operation.
+//!     `p` and runs the *entire thing again*.
 //!
-//! The win: [`Real`] implements [`Scalar`], so [`crate::generic`]'s
-//! Gram–Schmidt and Jacobi run over it **unchanged** — and now fast, because
-//! each pass is bounded-size interval arithmetic and only a handful of passes
-//! are needed. Correctness is preserved: the driver never returns an
-//! under-resolved answer; worst case it re-runs at higher precision.
+//! [`Real`] implements [`Scalar`], so [`crate::generic`]'s Gram–Schmidt and
+//! Jacobi run over it **unchanged** — fast, exact, and adaptive.
 
 use crate::Scalar;
 use core::cell::Cell;
 use core::cmp::Ordering;
 use core::ops::{Add, Div, Mul, Neg, Sub};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 thread_local! {
-    static PREC: Cell<i64> = const { Cell::new(64) };     // working precision (bits)
+    static PREC: Cell<i64> = const { Cell::new(64) };
     static REITERATE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -41,169 +39,169 @@ fn signal_reiterate() {
     REITERATE.with(|c| c.set(true));
 }
 
-/// `2^(−p)` as a rational.
-fn pow2(p: i64) -> BigRational {
-    if p >= 0 {
-        BigRational::new(BigInt::one(), BigInt::one() << (p as u64))
+// --- integer helpers: floor/ceil division, and ±∞-safe power-of-two shifts ---
+
+fn fdiv(a: &BigInt, b: &BigInt) -> BigInt {
+    let q = a / b;
+    let r = a % b;
+    if !r.is_zero() && r.sign() != b.sign() {
+        q - 1
     } else {
-        BigRational::from(BigInt::one() << ((-p) as u64))
+        q
     }
 }
-
-/// Round `q` to a multiple of `2^(−prec)`, outward (`up` ⇒ toward +∞, else −∞).
-/// Keeps every endpoint a bounded-size dyadic, which is what makes this fast.
-fn round_abs(q: &BigRational, prec: i64, up: bool) -> BigRational {
-    let scale = BigInt::one() << (prec.max(0) as u64);
-    let scaled = q * BigRational::from(scale.clone());
-    let int = if up { scaled.ceil() } else { scaled.floor() }.to_integer();
-    BigRational::new(int, scale)
+fn cdiv(a: &BigInt, b: &BigInt) -> BigInt {
+    let q = a / b;
+    let r = a % b;
+    if !r.is_zero() && r.sign() == b.sign() {
+        q + 1
+    } else {
+        q
+    }
+}
+/// `floor(x / 2^k)` via arithmetic right shift (rounds toward −∞ for all signs).
+fn shr_floor(x: &BigInt, k: i64) -> BigInt {
+    x >> (k as usize)
+}
+/// `ceil(x / 2^k)`.
+fn shr_ceil(x: &BigInt, k: i64) -> BigInt {
+    -(&(-x) >> (k as usize))
 }
 
-/// A real number as an enclosing interval at the current working precision.
+/// A real number as an enclosing interval of dyadic fixed-point numbers:
+/// the true value lies in `[lo·2^(-p), hi·2^(-p)]` at the working precision `p`.
 #[derive(Clone)]
 pub struct Real {
-    lo: BigRational,
-    hi: BigRational,
-}
-
-fn mk(lo: BigRational, hi: BigRational) -> Real {
-    let p = prec();
-    Real {
-        lo: round_abs(&lo, p, false),
-        hi: round_abs(&hi, p, true),
-    }
+    lo: BigInt,
+    hi: BigInt,
 }
 
 impl Real {
-    /// Exact: an `f64` is a dyadic rational, so its interval is a point.
+    /// Exact: an `f64` is a dyadic rational, placed as a (near-)point interval.
     pub fn from_f64(x: f64) -> Real {
+        let p = prec();
         let q = BigRational::from_float(x).expect("finite f64");
-        Real { lo: q.clone(), hi: q }
+        let num = q.numer() << (p as usize); // numer · 2^p
+        let d = q.denom();
+        Real {
+            lo: fdiv(&num, d),
+            hi: cdiv(&num, d),
+        }
     }
     pub fn from_i64(n: i64) -> Real {
-        let q = BigRational::from(BigInt::from(n));
-        Real { lo: q.clone(), hi: q }
-    }
-    fn mid(&self) -> BigRational {
-        (&self.lo + &self.hi) / BigRational::from(BigInt::from(2))
-    }
-    fn width(&self) -> BigRational {
-        &self.hi - &self.lo
+        let m = BigInt::from(n) << (prec() as usize);
+        Real { lo: m.clone(), hi: m }
     }
     /// Collapse to an `f64` (the interval midpoint).
     pub fn to_f64(&self) -> f64 {
-        ratio_to_f64(&self.mid())
+        // value = (lo+hi)/2 · 2^(-p) = (lo+hi) · 2^(-(p+1))
+        mantissa_to_f64(&(&self.lo + &self.hi), prec() + 1)
     }
 }
 
-// --- interval arithmetic (each op rounds endpoints to the working precision) --
-
-fn add_iv(a: &Real, b: &Real) -> Real {
-    mk(&a.lo + &b.lo, &a.hi + &b.hi)
-}
-fn sub_iv(a: &Real, b: &Real) -> Real {
-    mk(&a.lo - &b.hi, &a.hi - &b.lo)
-}
-fn neg_iv(a: &Real) -> Real {
-    mk(-&a.hi, -&a.lo)
-}
-fn mul_iv(a: &Real, b: &Real) -> Real {
-    let p = [
-        &a.lo * &b.lo,
-        &a.lo * &b.hi,
-        &a.hi * &b.lo,
-        &a.hi * &b.hi,
-    ];
-    let lo = p.iter().min().unwrap().clone();
-    let hi = p.iter().max().unwrap().clone();
-    mk(lo, hi)
-}
-fn recip_iv(b: &Real) -> Real {
-    let z = BigRational::zero();
-    if b.lo <= z && b.hi >= z {
-        // interval straddles 0 — reciprocal is unbounded; re-run at higher precision
-        signal_reiterate();
-        return mk(-BigRational::one(), BigRational::one());
-    }
-    let r1 = BigRational::one() / &b.lo;
-    let r2 = BigRational::one() / &b.hi;
-    let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
-    mk(lo, hi)
-}
-fn div_iv(a: &Real, b: &Real) -> Real {
-    mul_iv(a, &recip_iv(b))
-}
-fn abs_iv(a: &Real) -> Real {
-    let z = BigRational::zero();
-    if a.lo >= z {
-        a.clone()
-    } else if a.hi <= z {
-        neg_iv(a)
-    } else {
-        let m = (-&a.lo).max(a.hi.clone());
-        mk(z, m)
-    }
-}
-
-/// √c to within `2^(−q)`, for c ≥ 0 (Heron on rationals).
-fn sqrt_rat(c: &BigRational, q: i64) -> BigRational {
-    if c.is_zero() {
-        return BigRational::zero();
-    }
-    let (bn, bd) = (c.numer().bits() as i64, c.denom().bits() as i64);
-    let half = (bn - bd) / 2;
-    let mut x = if half >= 0 {
-        BigRational::from(BigInt::one() << (half as u64))
-    } else {
-        BigRational::new(BigInt::one(), BigInt::one() << ((-half) as u64))
-    };
-    if x <= BigRational::zero() {
-        x = BigRational::one();
-    }
-    let tol = pow2(q + 2);
-    let two = BigRational::from(BigInt::from(2));
-    for _ in 0..1000 {
-        let next = (x.clone() + c / x.clone()) / two.clone();
-        let diff = (next.clone() - x.clone()).abs();
-        x = next;
-        if diff < tol {
-            break;
-        }
-    }
-    x
-}
-fn sqrt_iv(a: &Real) -> Real {
-    let p = prec();
-    let z = BigRational::zero();
-    let lo_in = if a.lo < z { z.clone() } else { a.lo.clone() };
-    let hi_in = if a.hi < z { z.clone() } else { a.hi.clone() };
-    let eps = pow2(p + 3);
-    // outward bounds on √ of each endpoint
-    let lo = sqrt_rat(&lo_in, p + 4) - &eps;
-    let hi = sqrt_rat(&hi_in, p + 4) + &eps;
-    mk(lo.max(z), hi)
-}
-
-/// Convert a (possibly huge) rational to `f64` without an `inf/inf → NaN` trap.
-fn ratio_to_f64(q: &BigRational) -> f64 {
-    if q.is_zero() {
+/// `m · 2^(-s)` as an `f64`, without an `inf/inf → NaN` trap.
+fn mantissa_to_f64(m: &BigInt, s: i64) -> f64 {
+    if m.is_zero() {
         return 0.0;
     }
-    let neg = q.is_negative();
-    let n = q.numer().abs();
-    let d = q.denom().abs();
-    let (bn, bd) = (n.bits() as i64, d.bits() as i64);
-    let (kn, kd) = ((bn - 64).max(0), (bd - 64).max(0));
-    let ntop = (n >> kn as usize).to_f64().unwrap_or(f64::INFINITY);
-    let dtop = (d >> kd as usize).to_f64().unwrap_or(f64::INFINITY);
-    let mut v = (ntop / dtop) * 2f64.powi((kn - kd) as i32);
+    let neg = m.sign() == Sign::Minus;
+    let mag = m.magnitude();
+    let b = mag.bits() as i64;
+    let k = (b - 64).max(0);
+    let topf = (mag >> (k as usize)).to_f64().unwrap_or(f64::INFINITY);
+    let mut v = topf * 2f64.powi((k - s) as i32);
     if neg {
         v = -v;
     }
     v
 }
 
-// --- operators, ordering, and the Scalar impl -------------------------------
+// --- interval arithmetic in dyadic fixed-point --------------------------------
+
+fn add_iv(a: &Real, b: &Real) -> Real {
+    Real {
+        lo: &a.lo + &b.lo,
+        hi: &a.hi + &b.hi,
+    } // exact: same scale
+}
+fn sub_iv(a: &Real, b: &Real) -> Real {
+    Real {
+        lo: &a.lo - &b.hi,
+        hi: &a.hi - &b.lo,
+    }
+}
+fn neg_iv(a: &Real) -> Real {
+    Real {
+        lo: -&a.hi,
+        hi: -&a.lo,
+    }
+}
+fn mul_iv(a: &Real, b: &Real) -> Real {
+    // products are at scale 2^(-2p); shift back to 2^(-p), rounding outward.
+    let p = prec();
+    let c = [&a.lo * &b.lo, &a.lo * &b.hi, &a.hi * &b.lo, &a.hi * &b.hi];
+    let lo_c = c.iter().min().unwrap();
+    let hi_c = c.iter().max().unwrap();
+    Real {
+        lo: shr_floor(lo_c, p),
+        hi: shr_ceil(hi_c, p),
+    }
+}
+fn recip_iv(b: &Real) -> Real {
+    let p = prec();
+    let z = BigInt::zero();
+    if b.lo <= z && b.hi >= z {
+        signal_reiterate(); // interval straddles 0 — reciprocal unbounded
+        let one = BigInt::one() << (p as usize);
+        return Real { lo: -&one, hi: one };
+    }
+    // value recip at scale 2^(-p): mantissa = 2^(2p) / b_endpoint
+    let num = BigInt::one() << (2 * p as usize);
+    Real {
+        lo: fdiv(&num, &b.hi),
+        hi: cdiv(&num, &b.lo),
+    }
+}
+fn div_iv(a: &Real, b: &Real) -> Real {
+    mul_iv(a, &recip_iv(b))
+}
+fn abs_iv(a: &Real) -> Real {
+    let z = BigInt::zero();
+    if a.lo >= z {
+        a.clone()
+    } else if a.hi <= z {
+        neg_iv(a)
+    } else {
+        Real {
+            lo: z,
+            hi: (-&a.lo).max(a.hi.clone()),
+        }
+    }
+}
+fn isqrt_floor(x: &BigInt) -> BigInt {
+    x.sqrt() // floor integer sqrt, x >= 0
+}
+fn isqrt_ceil(x: &BigInt) -> BigInt {
+    let s = x.sqrt();
+    if &(&s * &s) == x {
+        s
+    } else {
+        s + 1
+    }
+}
+fn sqrt_iv(a: &Real) -> Real {
+    let p = prec();
+    let z = BigInt::zero();
+    let lo_in = if a.lo < z { z.clone() } else { a.lo.clone() };
+    let hi_in = if a.hi < z { z.clone() } else { a.hi.clone() };
+    // √(m·2^-p) at scale 2^-p has mantissa isqrt(m·2^p)
+    Real {
+        lo: isqrt_floor(&(lo_in << (p as usize))),
+        hi: isqrt_ceil(&(hi_in << (p as usize))),
+    }
+}
+
+// --- operators, ordering, Scalar impl ----------------------------------------
 
 impl Add for Real {
     type Output = Real;
@@ -248,7 +246,6 @@ impl PartialOrd for Real {
         } else if self.lo > o.hi {
             Some(Ordering::Greater)
         } else {
-            // intervals overlap — undecidable at this precision; ask to re-run
             signal_reiterate();
             None
         }
@@ -272,22 +269,29 @@ impl Scalar for Real {
         }
         r
     }
-    // dot / nrm2 use the naive trait defaults — correct over intervals.
 }
 
-// --- the driver: run the whole computation, re-run at 2× precision if loose --
+// --- driver: run the whole computation, re-run at 2× precision if loose -------
 
 fn width_ok(iv: &Real, target: i64) -> bool {
-    let thresh = pow2(target);
-    let m = iv.mid().abs();
-    iv.width() < thresh * (m + BigRational::one()) // relative-or-absolute
+    let p = prec();
+    let w = &iv.hi - &iv.lo;
+    let thresh_abs = if p >= target {
+        BigInt::one() << ((p - target) as usize)
+    } else {
+        BigInt::zero()
+    };
+    if w <= thresh_abs {
+        return true; // absolute width < 2^-target
+    }
+    // relative: w·2^target ≤ |mid|, with mid·2 = lo+hi
+    let mid2 = (&iv.lo + &iv.hi).abs();
+    (w << (target as usize)) * 2 <= mid2
 }
 
-/// Run `f` (a computation producing enclosing [`Real`]s) at increasing working
-/// precision until every output is accurate to `target` bits and no comparison
-/// reiterated, then collapse the outputs to `f64`. `f` must rebuild its `Real`s
-/// from their seeds each call — that is what makes re-running at higher
-/// precision meaningful.
+/// Run `f` at increasing working precision until every output is accurate to
+/// `target` bits and no comparison reiterated, then collapse to `f64`. `f` must
+/// rebuild its `Real`s from their seeds each call.
 pub fn run<F: Fn() -> Vec<Real>>(target: i64, f: F) -> Vec<f64> {
     let mut p = 64i64;
     loop {
@@ -298,7 +302,7 @@ pub fn run<F: Fn() -> Vec<Real>>(target: i64, f: F) -> Vec<f64> {
         if !reiterated && out.iter().all(|iv| width_ok(iv, target)) {
             return out.iter().map(|iv| iv.to_f64()).collect();
         }
-        if p > (1 << 20) {
+        if p > (1 << 15) {
             return out.iter().map(|iv| iv.to_f64()).collect(); // best effort
         }
         p *= 2;
@@ -319,7 +323,6 @@ mod unit {
         let r2 = run_scalar(50, || Real::from_i64(2).sqrt());
         assert!((r2 - 2f64.sqrt()).abs() < 1e-14);
 
-        // √(x+1) − √x at x = 1e14: catastrophic cancellation in f64, exact here.
         let x = 1e14_f64;
         let got = run_scalar(50, || {
             let xr = Real::from_f64(x);
