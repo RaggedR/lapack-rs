@@ -17,9 +17,10 @@ A routine is "reimplemented" only once it matches a reference computation to
 within a backward-error bound across adversarial inputs — not merely once it
 compiles and returns a plausible number.
 
-## Three layers
+## The six layers
 
-The repo grew a small theory of *why* these routines look the way they do:
+The repo grew a small theory of *why* these routines look the way they do
+(layers 1–3), plus the carriers that make the naive formulas safe (4–6):
 
 1. **`src/lib.rs` — the routine.** A faithful three-bin `nrm2`, generic over
    `f32`/`f64`, validated against independent oracles.
@@ -68,26 +69,45 @@ Demo of layers 3–4: `cargo run --example graded_demo`.
 6. **`src/irram.rs` — the exact carrier done right.** An iRRAM-style `Real`
    (after Norbert Müller's *iRRAM*, the C++ exact-real-arithmetic library built
    on the Real-RAM model, whose reiterate-on-imprecision architecture this
-   follows): imperative
-   *interval* arithmetic over multi-precision rationals (endpoints rounded
-   outward each op, so numbers stay bounded = fast), comparisons that signal
-   *reiterate* when they cannot resolve, and a `run` driver that executes the
-   whole computation at precision `p` and re-runs at `2p` until the output is
-   tight enough. `Real` implements `Scalar`, so `generic::gram_schmidt` and
+   follows): imperative *interval* arithmetic in **dyadic fixed-point** — the
+   endpoints are integer mantissas at the working-precision exponent, so there
+   are no rationals and no GCD; add/sub are integer add/sub, `√` is a single
+   integer square root, and comparison is a bare integer compare. Comparisons
+   that cannot resolve signal *reiterate*, and a `run` driver executes the whole
+   computation at precision `p` and re-runs at `2p` until the output is tight
+   enough. `Real` implements `Scalar`, so `generic::gram_schmidt` and
    `generic::jacobi_eigen` run over it **unchanged** — now fast *and* exact *and*
-   adaptive (a 3×3 Jacobi that never finished over `CReal` runs in seconds
-   here). This is what makes the exact carrier practical for the deep,
-   division-heavy algorithms, not just shallow expressions.
+   adaptive: a 3×3 Jacobi that never finished over `CReal` runs in well under a
+   millisecond, within ~30–125× of Arb (see [`BENCHMARKS.md`](BENCHMARKS.md)).
+   The fixed-point representation alone was 7×–840× faster than an earlier
+   `BigRational` backend. This is what makes the exact carrier practical for the
+   deep, division-heavy algorithms, not just shallow expressions.
 
 ### Two axes of floating-point safety
 
 | failure mode | cause | fix in this repo | cost |
 |---|---|---|---|
 | overflow / underflow | fixed **exponent range** too narrow | grading → exact power-of-two rescale (`eval_safe`) | cheap |
-| cancellation | fixed **53-bit mantissa** too short | exact carrier → `CReal`, float only at `extract` (`eval_exact`) | expensive |
+| cancellation | fixed **53-bit mantissa** too short | exact carrier (`CReal`, or the fast `irram::Real`), float only at the boundary | expensive |
 
 Both are dialed in *around* the naive formula without changing how it reads —
 one via a type-level degree, the other via a carrier swap.
+
+## Performance
+
+Honest numbers — see [`BENCHMARKS.md`](BENCHMARKS.md), reproducible via
+`cargo run --release --example bench`:
+
+- **f64 routines vs LAPACK** (Apple Accelerate): single-digit× on the
+  memory-bound `norm`, tens-to-hundreds× on compute-bound `matmul`/`QR` and
+  *widening* with n (LAPACK's cache-blocking + SIMD, which we don't attempt).
+- **Exact (iRRAM `Real`) vs Arb** (FLINT): ~30–125× slower at n=4 — within ~2
+  orders of magnitude of the state-of-the-art rigorous-arithmetic library, for a
+  from-scratch prototype. Arb itself is only ~12× off LAPACK at this size.
+
+This is a teaching repo, not a fast one: the algorithms are naive (no blocking,
+no SIMD) and the exact carrier is a prototype (endpoint intervals, pure-Rust
+bignum). The point is *why* the routines look the way they do, not Mflops.
 
 ## Routines so far
 
