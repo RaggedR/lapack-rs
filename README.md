@@ -60,11 +60,23 @@ Demo of layers 3–4: `cargo run --example graded_demo`.
    carrier-specific safety lives in `T::dot`/`T::nrm2`, the arithmetic reads
    with ordinary operators. This is how the *same naive algorithm* gains both an
    overflow-safe and a cancellation-safe mode. `CReal` now has division,
-   ordering, and operators, and `eval` is memoized. **Honest limit:** the exact
-   carrier is fast for *shallow* expressions (dot products, `√(x+1)−√x`) but
-   impractically slow for division-heavy iterative algorithms (Gram–Schmidt,
-   Jacobi) — those run over `CReal` correctly but in minutes, so only their
-   `::<f64>` instantiations are in the default test suite.
+   ordering, and operators, and `eval` is memoized. `CReal` is a *lazy* exact
+   real: fast for *shallow* expressions (dot products, `√(x+1)−√x`) but
+   impractically slow for division-heavy iterative algorithms, because it
+   re-walks a growing DAG at escalating precision.
+
+6. **`src/irram.rs` — the exact carrier done right.** An iRRAM-style `Real`
+   (named after Norbert Müller's *iRRAM* C++ library — "iteration on the
+   RaRaM", the exact-real-arithmetic framework this follows): imperative
+   *interval* arithmetic over multi-precision rationals (endpoints rounded
+   outward each op, so numbers stay bounded = fast), comparisons that signal
+   *reiterate* when they cannot resolve, and a `run` driver that executes the
+   whole computation at precision `p` and re-runs at `2p` until the output is
+   tight enough. `Real` implements `Scalar`, so `generic::gram_schmidt` and
+   `generic::jacobi_eigen` run over it **unchanged** — now fast *and* exact *and*
+   adaptive (a 3×3 Jacobi that never finished over `CReal` runs in seconds
+   here). This is what makes the exact carrier practical for the deep,
+   division-heavy algorithms, not just shallow expressions.
 
 ### Two axes of floating-point safety
 

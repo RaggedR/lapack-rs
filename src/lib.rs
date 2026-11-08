@@ -13,6 +13,7 @@ use core::ops::{Add, Div, Mul, Neg, Sub};
 pub mod equivariant;
 pub mod generic;
 pub mod graded;
+pub mod irram;
 pub mod matrix;
 pub mod real;
 pub mod tensor;
