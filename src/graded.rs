@@ -173,12 +173,12 @@ fn eval_node<S: Scalar>(n: &Node, inp: &[S]) -> S {
     match n {
         Node::Var(i) => inp[*i].clone(),
         Node::Const(c) => S::from_f64(*c),
-        Node::Add(a, b) => eval_node::<S>(a, inp).add(&eval_node::<S>(b, inp)),
-        Node::Sub(a, b) => eval_node::<S>(a, inp).sub(&eval_node::<S>(b, inp)),
-        Node::Mul(a, b) => eval_node::<S>(a, inp).mul(&eval_node::<S>(b, inp)),
-        Node::Div(a, b) => eval_node::<S>(a, inp).div(&eval_node::<S>(b, inp)),
+        Node::Add(a, b) => eval_node::<S>(a, inp) + eval_node::<S>(b, inp),
+        Node::Sub(a, b) => eval_node::<S>(a, inp) - eval_node::<S>(b, inp),
+        Node::Mul(a, b) => eval_node::<S>(a, inp) * eval_node::<S>(b, inp),
+        Node::Div(a, b) => eval_node::<S>(a, inp) / eval_node::<S>(b, inp),
         Node::Sqrt(a) => eval_node::<S>(a, inp).sqrt(),
-        Node::Neg(a) => eval_node::<S>(a, inp).neg(),
+        Node::Neg(a) => -eval_node::<S>(a, inp),
         Node::Abs(a) => eval_node::<S>(a, inp).abs(),
         Node::Powi(a, n) => eval_node::<S>(a, inp).powi(*n),
     }

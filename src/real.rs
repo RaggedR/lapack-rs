@@ -16,15 +16,26 @@
 //! `f64` range. That is precisely the difference between a "float-native" and
 //! an "ℝ-native" computation.
 //!
+//! Supports `+ − × ÷`, `√`, ordering, and the operators (so it can carry the
+//! generic routines in [`crate::generic`]). `eval` is memoized, so a shared
+//! subexpression is computed once per precision rather than re-walked.
+//!
 //! Scope/honesty: the multiplication modulus and the Heron `sqrt` are
 //! demonstration-grade (correct to the requested precision for the finite
-//! expressions used here), not a certified exact-real library à la iRRAM.
-//! Division/`recip` is deliberately omitted for now.
+//! expressions used here), not a certified exact-real library à la iRRAM. It is
+//! fast for *shallow* expressions (cancellation-safe dot products, `√(x+1)−√x`)
+//! but **impractically slow for deep/iterative algorithms** (Gram–Schmidt,
+//! Jacobi) because division re-probes at escalating precision through every
+//! nested reciprocal — a known exact-real cost that needs precision-bounded
+//! "force/collapse" to tame, which is out of scope here.
 
 use crate::Scalar;
+use core::cmp::Ordering;
+use core::ops::{Add, Div, DivAssign, Mul, Neg, Sub, SubAssign};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 /// A computable real: ask it for a precision, it returns a rational that close.
@@ -32,10 +43,19 @@ use std::rc::Rc;
 pub struct CReal {
     /// Contract: `(approx)(p)` returns `q` with `|q − x| ≤ 2^(−p)`.
     approx: Rc<dyn Fn(i64) -> BigRational>,
+    /// Memo of the highest precision evaluated so far and its result. Shared by
+    /// clones (an `Rc`), so a subexpression reused many times — the norm in
+    /// every projection of Gram–Schmidt, say — is computed once per precision
+    /// instead of re-walked each time. Without this, exact-real evaluation of a
+    /// shared DAG is exponential; with it, linear.
+    memo: Rc<RefCell<Option<(i64, BigRational)>>>,
 }
 
 fn of(f: impl Fn(i64) -> BigRational + 'static) -> CReal {
-    CReal { approx: Rc::new(f) }
+    CReal {
+        approx: Rc::new(f),
+        memo: Rc::new(RefCell::new(None)),
+    }
 }
 
 fn two() -> BigRational {
@@ -53,8 +73,17 @@ fn pow2(p: i64) -> BigRational {
 
 impl CReal {
     /// Evaluate the refiner at precision `p`: a rational within `2^(−p)`.
+    /// Memoized: a cached result at precision `pc ≥ p` already satisfies the
+    /// `2^(−p)` contract, so it is returned directly.
     pub fn eval(&self, p: i64) -> BigRational {
-        (self.approx)(p)
+        if let Some((pc, qc)) = self.memo.borrow().as_ref() {
+            if *pc >= p {
+                return qc.clone();
+            }
+        }
+        let q = (self.approx)(p);
+        *self.memo.borrow_mut() = Some((p, q.clone()));
+        q
     }
 
     pub fn from_i64(n: i64) -> CReal {
@@ -116,7 +145,7 @@ impl CReal {
         assert!(n >= 0, "CReal::powi supports n ≥ 0 (no recip yet)");
         let mut r = CReal::from_i64(1);
         for _ in 0..n {
-            r = r.mul(self);
+            r = CReal::mul(&r, self);
         }
         r
     }
@@ -149,6 +178,52 @@ impl CReal {
             p *= 2;
         }
         0.0 // indistinguishable from zero at 2^-65536
+    }
+
+    /// An exponent `L` with `|x| ≥ 2^(−L)`, found by probing until the value
+    /// resolves as clearly nonzero. Panics if `x` looks like zero (division and
+    /// sign of an exact zero are undecidable — a fundamental limit, not a bug).
+    fn lower_bound_exp(&self) -> i64 {
+        let mut k = 1i64;
+        while k <= 1 << 16 {
+            if self.eval(k).abs() > two() * pow2(k) {
+                return k; // |x| > 2^(-k)
+            }
+            k *= 2;
+        }
+        panic!("CReal: value indistinguishable from zero (recip/sign undecidable)")
+    }
+
+    /// The sign of `x`: `+1`, `-1`, or `0` if it cannot be resolved (i.e. `x`
+    /// is zero, or too close to zero to tell within the probe budget).
+    fn sign_probe(&self) -> i32 {
+        let mut k = 1i64;
+        while k <= 1 << 16 {
+            let q = self.eval(k);
+            if q.abs() > two() * pow2(k) {
+                return if q.is_positive() { 1 } else { -1 };
+            }
+            k *= 2;
+        }
+        0
+    }
+
+    /// Reciprocal `1/x` for `x ≠ 0`. To deliver `2^(−p)` the input is evaluated
+    /// to `2^(−(p+2L+2))`, where `2^(−L)` lower-bounds `|x|` — because the
+    /// sensitivity of `1/x` is `1/x²`, tiny values need correspondingly more
+    /// input precision. (No premature rounding ⇒ cancellation-safe.)
+    pub fn recip(&self) -> CReal {
+        let a = self.clone();
+        let l = a.lower_bound_exp();
+        of(move |p| {
+            let q = (p + 2 * l + 2).max(l + 1);
+            a.eval(q).recip()
+        })
+    }
+
+    /// Division `x / y` = `x · (1/y)`.
+    pub fn div(&self, o: &CReal) -> CReal {
+        CReal::mul(self, &o.recip())
     }
 }
 
@@ -215,21 +290,6 @@ impl Scalar for CReal {
     fn from_f64(x: f64) -> Self {
         CReal::from_f64(x)
     }
-    fn add(&self, o: &Self) -> Self {
-        CReal::add(self, o)
-    }
-    fn sub(&self, o: &Self) -> Self {
-        CReal::sub(self, o)
-    }
-    fn mul(&self, o: &Self) -> Self {
-        CReal::mul(self, o)
-    }
-    fn div(&self, _o: &Self) -> Self {
-        unimplemented!("exact-real division is future work; the ℝ-native demos are division-free")
-    }
-    fn neg(&self) -> Self {
-        CReal::neg(self)
-    }
     fn abs(&self) -> Self {
         CReal::abs(self)
     }
@@ -238,6 +298,68 @@ impl Scalar for CReal {
     }
     fn powi(&self, n: i32) -> Self {
         CReal::powi(self, n)
+    }
+    // dot / nrm2 use the naive trait defaults — exact, because CReal never overflows.
+}
+
+// Operator overloading, so generic numeric code reads the same over CReal as
+// over f64 (`a * b`, `a - b`, `w /= nrm`, ...). The Rc clone is cheap.
+impl Add for CReal {
+    type Output = CReal;
+    fn add(self, o: CReal) -> CReal {
+        CReal::add(&self, &o)
+    }
+}
+impl Sub for CReal {
+    type Output = CReal;
+    fn sub(self, o: CReal) -> CReal {
+        CReal::sub(&self, &o)
+    }
+}
+impl Mul for CReal {
+    type Output = CReal;
+    fn mul(self, o: CReal) -> CReal {
+        CReal::mul(&self, &o)
+    }
+}
+impl Div for CReal {
+    type Output = CReal;
+    fn div(self, o: CReal) -> CReal {
+        CReal::div(&self, &o)
+    }
+}
+impl Neg for CReal {
+    type Output = CReal;
+    fn neg(self) -> CReal {
+        CReal::neg(&self)
+    }
+}
+impl SubAssign for CReal {
+    fn sub_assign(&mut self, o: CReal) {
+        *self = CReal::sub(self, &o);
+    }
+}
+impl DivAssign for CReal {
+    fn div_assign(&mut self, o: CReal) {
+        *self = CReal::div(self, &o);
+    }
+}
+
+// Order and equality by resolving the sign of the difference. Equality of exact
+// reals is only semi-decidable: an exact zero difference falls through to
+// `Equal` after the probe budget, which is the honest best a machine can do.
+impl PartialEq for CReal {
+    fn eq(&self, o: &CReal) -> bool {
+        CReal::sub(self, o).sign_probe() == 0
+    }
+}
+impl PartialOrd for CReal {
+    fn partial_cmp(&self, o: &CReal) -> Option<Ordering> {
+        Some(match CReal::sub(self, o).sign_probe() {
+            -1 => Ordering::Less,
+            1 => Ordering::Greater,
+            _ => Ordering::Equal,
+        })
     }
 }
 
@@ -263,9 +385,33 @@ mod unit {
     fn no_overflow_until_extract() {
         // x = 1e200; x*x = 1e400 — impossible in f64, trivial as a rational.
         let x = CReal::from_f64(1e200);
-        let sumsq = x.mul(&x).add(&x.mul(&x)); // 2e400, exact
+        let sumsq = x.clone() * x.clone() + x.clone() * x.clone(); // 2e400, exact
         let norm = sumsq.sqrt(); // ≈ 1.414e200, representable
         assert!(close(norm.extract(), 1e200 * 2f64.sqrt(), 1e-14));
+    }
+
+    #[test]
+    fn division_is_correct() {
+        // 1/3 to full precision
+        assert!(close((CReal::from_i64(1) / CReal::from_i64(3)).extract(), 1.0 / 3.0, 1e-15));
+        // 22/7, and a tiny-denominator case that stresses the recip modulus
+        assert!(close((CReal::from_i64(22) / CReal::from_i64(7)).extract(), 22.0 / 7.0, 1e-15));
+        let tiny = CReal::from_f64(1e-100);
+        assert!(close((CReal::from_i64(1) / tiny).extract(), 1e100, 1e-12));
+        // (a/b)*b == a
+        let (a, b) = (CReal::from_f64(2.5), CReal::from_f64(0.7));
+        assert!(close(((a.clone() / b.clone()) * b.clone()).extract(), 2.5, 1e-14));
+    }
+
+    #[test]
+    fn ordering_and_sign_resolve() {
+        assert!(CReal::from_f64(0.1) < CReal::from_f64(0.2));
+        assert!(CReal::from_i64(5) > CReal::from_i64(3));
+        assert!(CReal::from_f64(2.0).sqrt() > CReal::from_i64(1));
+        // operators compose as expected
+        let x = CReal::from_f64(3.0);
+        let y = CReal::from_f64(4.0);
+        assert!(close((x.clone() * x + y.clone() * y).sqrt().extract(), 5.0, 1e-15));
     }
 
     #[test]
@@ -273,7 +419,7 @@ mod unit {
         // The underflow-of-significance case that caught the fixed-precision bug.
         for &a in &[1e-200_f64, 1e-150, 1e-300] {
             let x = CReal::from_f64(a);
-            let norm = x.mul(&x).add(&x.mul(&x)).sqrt(); // a·√2
+            let norm = (x.clone() * x.clone() + x.clone() * x.clone()).sqrt(); // a·√2
             assert!(
                 close(norm.extract(), a * 2f64.sqrt(), 1e-14),
                 "a={a:e}: got {}, want {}",

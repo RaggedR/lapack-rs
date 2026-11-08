@@ -8,48 +8,67 @@
 //!
 //! First routine: [`nrm2`], the Euclidean norm ‖x‖₂.
 
-use core::ops::{Add, Div, Mul};
+use core::ops::{Add, Div, Mul, Neg, Sub};
 
 pub mod equivariant;
+pub mod generic;
 pub mod graded;
 pub mod matrix;
 pub mod real;
 pub mod tensor;
 
-/// A numeric scalar the graded DSL can evaluate over. Implemented by `f64` (the
-/// leaky, finite carrier) and by [`real::CReal`] (the exact, arbitrary-precision
-/// carrier). The *same* [`graded::Expr`] runs over either — which is the whole
-/// point: over `f64` it needs safe scaling, over `CReal` it needs none.
-pub trait Scalar: Clone {
+/// A numeric scalar the generic routines evaluate over. Implemented by `f64`
+/// (the leaky, finite carrier) and by [`real::CReal`] (the exact,
+/// arbitrary-precision carrier). Arithmetic is via the ordinary operators
+/// (`+ - * /`, unary `-`) so generic code reads like the naive f64 version; the
+/// carrier-specific *safety* lives in [`Scalar::dot`] and [`Scalar::nrm2`],
+/// which `f64` overrides with its safe-scaling implementations while `CReal`
+/// inherits the exact (naive) defaults — because exact reals never overflow.
+///
+/// This is the generic that lets the SAME algorithm run fast-but-magnitude-safe
+/// over `f64` or slow-but-fully-exact over `CReal`, with identical source.
+pub trait Scalar:
+    Clone
+    + PartialOrd
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Div<Output = Self>
+    + Neg<Output = Self>
+{
     fn from_f64(x: f64) -> Self;
-    fn add(&self, o: &Self) -> Self;
-    fn sub(&self, o: &Self) -> Self;
-    fn mul(&self, o: &Self) -> Self;
-    fn div(&self, o: &Self) -> Self;
-    fn neg(&self) -> Self;
     fn abs(&self) -> Self;
     fn sqrt(&self) -> Self;
     fn powi(&self, n: i32) -> Self;
+
+    fn zero() -> Self {
+        Self::from_f64(0.0)
+    }
+
+    /// Inner product ⟨x, y⟩, safe for this carrier. Default is the naive sum of
+    /// products (exact over `CReal`); `f64` overrides it with safe scaling.
+    fn dot(x: &[Self], y: &[Self]) -> Self {
+        let mut s = Self::zero();
+        for i in 0..x.len() {
+            s = s + x[i].clone() * y[i].clone();
+        }
+        s
+    }
+
+    /// Euclidean norm ‖x‖₂, safe for this carrier. Default naive (exact over
+    /// `CReal`); `f64` overrides with the three-bin safe scaling.
+    fn nrm2(x: &[Self]) -> Self {
+        let mut s = Self::zero();
+        for v in x {
+            s = s + v.clone() * v.clone();
+        }
+        s.sqrt()
+    }
 }
 
 impl Scalar for f64 {
     fn from_f64(x: f64) -> Self {
         x
-    }
-    fn add(&self, o: &Self) -> Self {
-        self + o
-    }
-    fn sub(&self, o: &Self) -> Self {
-        self - o
-    }
-    fn mul(&self, o: &Self) -> Self {
-        self * o
-    }
-    fn div(&self, o: &Self) -> Self {
-        self / o
-    }
-    fn neg(&self) -> Self {
-        -self
     }
     fn abs(&self) -> Self {
         (*self).abs()
@@ -59,6 +78,12 @@ impl Scalar for f64 {
     }
     fn powi(&self, n: i32) -> Self {
         (*self).powi(n)
+    }
+    fn dot(x: &[f64], y: &[f64]) -> f64 {
+        crate::matrix::dot(x, y) // the magnitude-safe, bigraded f64 dot
+    }
+    fn nrm2(x: &[f64]) -> f64 {
+        crate::equivariant::nrm2(x) // the three-bin safe norm
     }
 }
 

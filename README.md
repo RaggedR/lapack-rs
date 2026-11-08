@@ -54,6 +54,28 @@ The repo grew a small theory of *why* these routines look the way they do:
 
 Demo of layers 3–4: `cargo run --example graded_demo`.
 
+5. **`src/generic.rs` — one body, two carriers.** The matrix operations written
+   once over a generic `Scalar`, run `::<f64>` (fast, magnitude-safe) or
+   `::<CReal>` (exact, cancellation-proof) from identical source — the
+   carrier-specific safety lives in `T::dot`/`T::nrm2`, the arithmetic reads
+   with ordinary operators. This is how the *same naive algorithm* gains both an
+   overflow-safe and a cancellation-safe mode. `CReal` now has division,
+   ordering, and operators, and `eval` is memoized. **Honest limit:** the exact
+   carrier is fast for *shallow* expressions (dot products, `√(x+1)−√x`) but
+   impractically slow for division-heavy iterative algorithms (Gram–Schmidt,
+   Jacobi) — those run over `CReal` correctly but in minutes, so only their
+   `::<f64>` instantiations are in the default test suite.
+
+### Two axes of floating-point safety
+
+| failure mode | cause | fix in this repo | cost |
+|---|---|---|---|
+| overflow / underflow | fixed **exponent range** too narrow | grading → exact power-of-two rescale (`eval_safe`) | cheap |
+| cancellation | fixed **53-bit mantissa** too short | exact carrier → `CReal`, float only at `extract` (`eval_exact`) | expensive |
+
+Both are dialed in *around* the naive formula without changing how it reads —
+one via a type-level degree, the other via a carrier swap.
+
 ## Routines so far
 
 | Routine | LAPACK name | Status | Oracle |
