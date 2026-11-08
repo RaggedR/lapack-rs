@@ -1,0 +1,367 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{fancyvrb}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+
+\definecolor{ideabg}{RGB}{255,249,230}
+\definecolor{ideaframe}{RGB}{200,120,0}
+\definecolor{codebg}{RGB}{245,245,245}
+
+\newtcolorbox{keyidea}{
+  colback=ideabg, colframe=ideaframe, boxrule=0.6pt, arc=2pt,
+  left=8pt, right=8pt, top=7pt, bottom=7pt, breakable
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\vspace{-1.5em}How the Graded DSL Works\\[0.3em]
+  \large An embedded, type-level-graded language for safe floating point}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\noindent
+This note explains, from the ground up, how the little language in
+\code{src/graded.rs} works. It assumes no background in programming-language
+theory. One running example is used throughout: the formula
+
+\begin{center}
+\code{(var(0) * var(0) + var(1) * var(1)).sqrt()}
+\end{center}
+
+\noindent
+which is just the length of a vector, $\sqrt{x^{2}+y^{2}}$. Four questions are
+answered in turn: what an \emph{embedded DSL} is, what the \emph{type checker}
+did, in what sense the language is \emph{interpreted}, and the role of
+\emph{operator overloading}.
+
+\section{What an embedded DSL is}
+
+A \textbf{DSL} (domain-specific language) is a small language built for one
+narrow job. SQL is one: its job is database queries. Regular expressions are
+one: their job is text patterns.
+
+There are two ways to make a DSL:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{External DSL.} You invent brand-new syntax and write a program
+  (a \emph{parser}) that reads that text and makes sense of it. \code{SELECT *
+  FROM users} is not valid in any ordinary programming language; somebody wrote
+  a parser that understands those words.
+  \item \textbf{Embedded DSL.} You do \emph{not} invent new syntax. You write
+  your little language using the ordinary grammar of a \emph{host} language ---
+  here, Rust --- and simply arrange for the pieces to \emph{mean} something
+  special. It is ``embedded'' because it lives inside Rust; the Rust compiler
+  reads it as ordinary Rust.
+\end{itemize}
+
+Our language is \textbf{embedded}. When you write \code{var(0) * var(0)}, you
+are writing one hundred percent legal Rust. There is no parser and no new
+grammar. The ordinary Rust pieces have just been given a special meaning.
+
+Here is the one idea that unlocks everything else.
+
+\begin{keyidea}
+\textbf{When you write \code{var(0) * var(0)}, no multiplication happens.} It
+\emph{looks} like arithmetic, but nothing is computed. Instead, Rust builds a
+little model --- think of it as writing the recipe step \emph{``multiply these
+two things''} on an index card, rather than actually multiplying. The whole
+formula becomes a stack of index cards describing what to do. The actual numbers
+do not exist yet.
+\end{keyidea}
+
+So \code{(var(0)*var(0) + var(1)*var(1)).sqrt()} does not produce a number. It
+produces a little \textbf{tree of index cards}:
+
+\begin{center}
+\begin{BVerbatim}
+            sqrt
+             |
+            add
+          /      \
+       mul        mul
+      /   \      /   \
+    x0    x0   x1    x1
+\end{BVerbatim}
+\end{center}
+
+This tree is called an \textbf{AST} (abstract syntax tree) --- a fancy name for
+``the recipe, stored as data.'' Building it is \emph{all} that happens when you
+write the formula.
+
+\section{What the type checker did}
+
+The \textbf{type checker} is a part of the Rust compiler. It runs \emph{before
+your program ever executes}, when you build it. Its normal job is to catch
+mismatches --- for instance, making sure you do not try to add a number to a
+piece of text. Every value has a \textbf{type} (a label saying what kind of
+thing it is: \code{Number}, \code{Text}, and so on), and the type checker makes
+sure the labels are consistent.
+
+Here is the trick. \textbf{A real number was hidden inside the type label.}
+
+Normally a label just says ``this is a Number.'' Our labels say ``this is an
+expression \emph{of degree 2}'' or ``\emph{of degree 0}.'' The \emph{degree} ---
+the homogeneity weight, i.e.\ how the value scales when you scale the inputs ---
+is baked into the type itself. And the labels carry arithmetic rules:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{var(0)} is labelled \textbf{degree 1}.
+  \item \textbf{Multiplying} two expressions makes the result's degree the
+  \textbf{sum} of the two: degree~1 times degree~1 gives degree~\textbf{2}.
+  \item \textbf{Adding} requires both sides to have the \textbf{same} degree, and
+  keeps it.
+  \item \textbf{\code{sqrt}} \textbf{halves} the degree --- and is only allowed
+  when the degree is even.
+\end{itemize}
+
+The striking part: because these rules live in the \emph{labels}, the type
+checker is forced to \emph{do the degree arithmetic while it checks your code},
+at compile time, before anything runs. Verifying that \code{var(0)*var(0)} is
+well-typed literally computes $1+1=2$. Checking the \code{.sqrt()} checks that
+$2$ is even and computes $2 \div 2 = 1$. The compiler has been turned into a
+little calculator for degrees.
+
+Two consequences, both at build time, not run time:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item The formula above comes out labelled \textbf{degree 1}. Later, the
+  evaluator reads that label to know how to rescale safely --- the degree was
+  computed by the compiler, for free, with zero runtime cost.
+  \item A formula whose degrees do not fit --- such as \code{x*x + 5}, which adds
+  degree~2 to degree~0 --- violates the rule for \code{+} (both sides must
+  match), and \textbf{the program refuses to compile.} Not a crash when it runs:
+  it never builds, exactly as if you had tried to add a number to text.
+\end{itemize}
+
+\begin{keyidea}
+A label like ``degree 2'' is normally static decoration. Here it is a
+\emph{number the compiler adds, halves, and compares}. Most languages use types
+only as coarse categories (``it's a Number''); this DSL uses the type as a
+\emph{quantity the compiler does mathematics on}. The payoff: the compiler
+proves a formula is scale-safe-able before it ever runs, and throws out the
+formulas that are not --- with no runtime check and no way to forget it.
+\end{keyidea}
+
+\section{In what sense it is interpreted}
+
+There are two ways to actually \emph{run} a language.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Compiled.} Translate the whole recipe, once, into raw machine
+  instructions the processor runs directly. Afterwards the recipe is gone; only
+  the machine code remains. Fast.
+  \item \textbf{Interpreted.} Keep the recipe around as data, and have a small
+  program --- the \emph{interpreter} --- read it step by step, each time you want
+  an answer, doing what each step says.
+\end{itemize}
+
+Our DSL is \textbf{interpreted}. Recall the tree of index cards. When you finally
+ask for a number --- \code{norm.eval\_safe(\&[3.0, 4.0])} --- a function walks
+that tree: \emph{``the top card says \code{sqrt}, so I first need the card below;
+it says \code{add}, so I need its two children; this one says multiply
+\code{x0} by \code{x0}, so look up $x_0 = 3$, multiply, get $9$}\,\ldots'' and so
+on back up. That walking-the-tree-and-doing-what-it-says is interpretation. The
+tree stays around; every evaluation re-walks it. The formula is \emph{never}
+turned into dedicated machine code of its own.
+
+\begin{keyidea}
+One honest subtlety: the interpreter itself \emph{is} ordinary Rust, which Rust
+compiles to machine code. So there is compiled code involved --- but it is the
+code of the \emph{interpreter}, not of your \emph{formula}. Distinguish ``the
+language the interpreter is written in'' (compiled Rust) from ``the little
+language the interpreter runs'' (your formulas, interpreted). The
+\code{compile\_safe} function, despite its name, does not compile anything: it
+just prints the recipe as text.
+\end{keyidea}
+
+\section{The role of operator overloading}
+
+The last piece: how is \code{var(0) * var(0)} even \emph{allowed} to mean ``build
+a multiply card'' instead of ``multiply''?
+
+\textbf{Operator overloading} means you get to decide what a symbol like \code{*}
+or \code{+} does \emph{when its operands are your own type}. Normally \code{*}
+means ``multiply two numbers,'' hardwired. Rust (like C++, Python, and others)
+instead lets you say: ``when someone writes \code{a * b} and \code{a}, \code{b}
+are my \code{Expr} type, here is what to do instead.'' What we told Rust to do
+for \code{*} was, in plain words:
+
+\begin{quote}
+``Do not multiply. Build a new \emph{multiply} index card pointing at the two
+operands. And set the result's degree label to the \emph{sum} of their degrees.''
+\end{quote}
+
+In code it is barely more than that:
+
+\begin{center}
+\begin{BVerbatim}
+impl Mul for Expr {              // "here is what * means for my Expr type"
+    fn mul(self, rhs) -> ... {
+        Expr::new(Node::Mul(self, rhs))   // build a card; do NOT compute
+    }
+}
+\end{BVerbatim}
+\end{center}
+
+Operator overloading is doing two jobs here:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Ergonomics.} It lets you write \code{x*x + y*y} with ordinary
+  infix symbols instead of ugly nested calls like \code{add(mul(x,x),
+  mul(y,y))}. The formula reads like mathematics. In most languages this nicer
+  syntax is the \emph{only} reason overloading exists.
+  \item \textbf{The hook.} Because we wrote the body of \code{*}, that body is
+  exactly where both behaviours were inserted: ``build a card'' (so nothing
+  computes yet) and ``add the degrees'' (the label arithmetic the type checker
+  later enforces). Every overloaded operator is a little hook where the DSL's
+  meaning is attached.
+\end{enumerate}
+
+\section{Where this pays off: the matrix operations}
+
+The whole point of the machinery is that real linear-algebra routines should
+read like their textbook definitions, with the safe rescaling generated rather
+than typed by hand. There is one new idea needed to get there.
+
+\subsection{One scaling knob becomes several}
+
+The scalar DSL had a single degree because there was one way to scale the inputs:
+multiply \emph{everything} by $2^{k}$. But an inner product
+$\langle x, y\rangle = \sum_i x_i y_i$ has \emph{two independent} knobs --- you
+can scale the $x$ vector and the $y$ vector separately --- and the result scales
+by the product. So the label now carries a \emph{pair} of degrees,
+$\langle D_x, D_y\rangle$. This is called \textbf{multigrading}.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{xvar()} (the $x$ vector) is labelled $\langle 1, 0\rangle$;
+  \code{yvar()} is $\langle 0, 1\rangle$.
+  \item Their elementwise product is $\langle 1, 1\rangle$ (the two labels add,
+  componentwise).
+  \item \code{sum(\ldots)} contracts a vector to a scalar and keeps the label.
+  \item Adding requires both labels to match --- so \code{xvar() + yvar()}
+  (that is $\langle 1,0\rangle + \langle 0,1\rangle$) is a \textbf{compile
+  error}: you may not add an $x$-vector to a $y$-vector.
+\end{itemize}
+
+\subsection{Inner product: before and after}
+
+Written by hand, the safe inner product carries the scaling openly --- find each
+block's exponent, rescale every term, transport the sum back:
+
+\begin{center}
+\begin{BVerbatim}
+let ex = block_exp(maxabs(x));
+let ey = block_exp(maxabs(y));
+let mut s = 0.0;
+for i in 0..n { s += ldexp(x[i], -ex) * ldexp(y[i], -ey); }
+ldexp(s, ex + ey)
+\end{BVerbatim}
+\end{center}
+
+In the DSL the same operation is the naive formula. The label
+$\langle 1,1\rangle$ is inferred by the compiler, and \code{eval\_safe} generates
+the rescaling:
+
+\begin{center}
+\begin{BVerbatim}
+let expr = sum(xvar() * yvar());   // bidegree <1,1>, inferred
+expr.eval_safe(x, y)               // the block_exp/ldexp is generated
+\end{BVerbatim}
+\end{center}
+
+\code{sum(x * y)} is simply the definition of an inner product.
+
+\subsection{The other three}
+
+\textbf{Matrix multiply} is ``each entry is the inner product of a row and a
+column,'' delegating to the DSL inner product:
+
+\begin{center}
+\begin{BVerbatim}
+for i in 0..rows {
+    for j in 0..cols {
+        c[i][j] = sum(xvar()*yvar()).eval_safe(row_i(A), col_j(B));
+    }
+}
+\end{BVerbatim}
+\end{center}
+
+\textbf{Gram--Schmidt} and \textbf{eigenvalues (Jacobi)} are \emph{algorithms},
+not single formulas --- they have loops and ``repeat until converged,'' which no
+one expression can capture. They stay textbook by \emph{delegation}: every step
+calls a safe primitive (\code{dot}, \code{nrm2}), so no scaling appears in them
+either. Gram--Schmidt, in full:
+
+\begin{center}
+\begin{BVerbatim}
+for j in 0..n {
+    let mut w = v[j];
+    for i in 0..j { let r = dot(q[i], w);  w -= r * q[i]; }  // remove projection
+    let nrm = nrm2(w);
+    if nrm > 0 { w /= nrm; }                                 // normalise
+    q[j] = w;
+}
+\end{BVerbatim}
+\end{center}
+
+\begin{keyidea}
+Count the scaling operations (\code{ldexp}) visible in the four routines:
+\textbf{zero, zero, zero, and two.} Inner product and matrix multiply have none
+--- the grading generated it. Gram--Schmidt has none --- it delegates to safe
+primitives. Only Jacobi has two lines (rescale once at the top, transport the
+eigenvalues once at the bottom), because an iterative algorithm cannot be a
+single graded formula. Every routine now reads the way you would write it on a
+whiteboard.
+\end{keyidea}
+
+There are, in fact, \emph{two} routes to ``looks naive but is safe,'' and the
+matrix layer uses whichever fits. Inner product and matrix multiply are safe
+by \textbf{grading}: you wrote the formula, a degree in the type generated the
+rescale. Gram--Schmidt and Jacobi are safe by \textbf{composition}: you wrote
+the algorithm, and it inherits safety from the primitives it calls --- which,
+not coincidentally, is how LAPACK itself is organised.
+
+\section{Putting the four together}
+
+\begin{center}
+\begin{BVerbatim}
+You write:    (var(0)*var(0) + var(1)*var(1)).sqrt()
+                        |
+   operator overloading makes each  *  +  sqrt  build an index
+   card instead of computing  -----------------------------+
+                        |                                   |
+                        v                                   v
+   AT COMPILE TIME:                        AT RUN TIME:
+   the type checker does the degree        eval_safe walks the
+   arithmetic (1+1=2, 2/2=1), labels       card-tree and does the
+   the result "degree 1", and REJECTS      actual numbers, reading
+   any formula whose degrees don't fit     the "degree 1" label to
+   (x*x + 5 won't even build)              rescale safely
+\end{BVerbatim}
+\end{center}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Embedded DSL:} a little language made of ordinary Rust pieces
+  that \emph{build a recipe} instead of computing.
+  \item \textbf{Operator overloading:} the mechanism that lets \code{* + /} build
+  recipe-cards (and carry the degree rules) instead of doing arithmetic.
+  \item \textbf{Type checker:} a compile-time calculator that runs the degree
+  arithmetic on the labels and throws out formulas that cannot be made safe ---
+  all before the program runs.
+  \item \textbf{Interpreted:} at run time, a function walks the recipe-tree step
+  by step to get the number; your formula is never turned into its own machine
+  code.
+\end{itemize}
+
+\end{document}
